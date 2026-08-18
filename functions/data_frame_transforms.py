@@ -1,0 +1,1592 @@
+
+import numpy as np
+import pandas as pd
+from datetime import datetime
+import itertools
+import spiceypy
+from pathlib import Path
+import os
+
+from functions_general import load_path
+
+# Load path once globally
+kernels_path = load_path(path_name='kernels_path')
+print(f"Kernels path loaded: {kernels_path}")
+
+#input datetime to return T1, T2 and T3 based on Hapgood 1992
+#http://www.igpp.ucla.edu/public/vassilis/ESS261/Lecture03/Hapgood_sdarticle.pdf
+def get_geocentric_transformation_matrices(time):
+    #format dates correctly, calculate MJD, T0, UT 
+    ts = pd.Timestamp(time)
+    jd=ts.to_julian_date()
+    mjd=float(int(jd-2400000.5)) #use modified julian date    
+    T0=(mjd-51544.5)/36525.0
+    UT=ts.hour + ts.minute / 60. + ts.second / 3600. #time in UT in hours    
+    #define position of geomagnetic pole in GEO coordinates
+    pgeo=78.8+4.283*((mjd-46066)/365.25)*0.01 #in degrees
+    lgeo=289.1-1.413*((mjd-46066)/365.25)*0.01 #in degrees
+    #GEO vector
+    Qg=[np.cos(pgeo*np.pi/180)*np.cos(lgeo*np.pi/180), np.cos(pgeo*np.pi/180)*np.sin(lgeo*np.pi/180), np.sin(pgeo*np.pi/180)]
+    #now move to equation at the end of the section, which goes back to equations 2 and 4:
+    #CREATE T1; T0, UT is known from above
+    zeta=(100.461+36000.770*T0+15.04107*UT)*np.pi/180
+    ################### theta und z
+    T1=np.matrix([[np.cos(zeta), np.sin(zeta),  0], [-np.sin(zeta) , np.cos(zeta) , 0], [0,  0,  1]]) #angle for transpose
+    LAMBDA=280.460+36000.772*T0+0.04107*UT
+    M=357.528+35999.050*T0+0.04107*UT
+    lt2=(LAMBDA+(1.915-0.0048*T0)*np.sin(M*np.pi/180)+0.020*np.sin(2*M*np.pi/180))*np.pi/180 #lamda sun
+    #CREATE T2, LAMBDA, M, lt2 known from above
+    ##################### lamdbda und Z
+    t2z=np.matrix([[np.cos(lt2), np.sin(lt2),  0], [-np.sin(lt2) , np.cos(lt2) , 0], [0,  0,  1]])
+    et2=(23.439-0.013*T0)*np.pi/180
+    ###################### epsilon und x
+    t2x=np.matrix([[1,0,0],[0,np.cos(et2), np.sin(et2)], [0, -np.sin(et2), np.cos(et2)]])
+    T2=np.dot(t2z,t2x)  #equation 4 in Hapgood 1992
+    #matrix multiplications   
+    T2T1t=np.dot(T2,np.matrix.transpose(T1))
+    ################
+    Qe=np.dot(T2T1t,Qg) #Q=T2*T1^-1*Qq
+    psigsm=np.arctan(Qe.item(1)/Qe.item(2)) #arctan(ye/ze) in between -pi/2 to +pi/2
+    T3=np.matrix([[1,0,0],[0,np.cos(-psigsm), np.sin(-psigsm)], [0, -np.sin(-psigsm), np.cos(-psigsm)]])
+    return T1, T2, T3
+
+
+def get_heliocentric_transformation_matrices(time):
+    #format dates correctly, calculate MJD, T0, UT 
+    ts = pd.Timestamp(time)
+    jd=ts.to_julian_date()
+    mjd=float(int(jd-2400000.5)) #use modified julian date    
+    T0=(mjd-51544.5)/36525.0
+    UT=ts.hour + ts.minute / 60. + ts.second / 3600. #time in UT in hours
+    #equation 12
+    LAMBDA=280.460+36000.772*T0+0.04107*UT
+    M=357.528+35999.050*T0+0.04107*UT
+    #lamda sun in radians
+    lt2=(LAMBDA+(1.915-0.0048*T0)*np.sin(M*np.pi/180)+0.020*np.sin(2*M*np.pi/180))*np.pi/180
+    #S1 matrix
+    S1=np.matrix([[np.cos(lt2+np.pi), np.sin(lt2+np.pi),  0], [-np.sin(lt2+np.pi) , np.cos(lt2+np.pi) , 0], [0,  0,  1]])
+    #equation 13
+    #create S2 matrix with angles with reversed sign for transformation HEEQ to HAE
+    iota=7.25*np.pi/180
+    omega=(73.6667+0.013958*((mjd+3242)/365.25))*np.pi/180 #in rad         
+    theta=np.arctan(np.cos(iota)*np.tan(lt2-omega))
+    #quadrant of theta must be opposite lt2 - omega; Hapgood 1992 end of section 5   
+    #get lambda-omega angle in degree mod 360   
+    lambda_omega_deg=np.mod(lt2-omega,2*np.pi)*180/np.pi
+    x = np.cos(np.deg2rad(lambda_omega_deg))
+    y = np.sin(np.deg2rad(lambda_omega_deg))
+    #get theta_node in deg
+    x_theta = np.cos(theta)
+    y_theta = np.sin(theta)
+    #if in same quadrant, then theta_node = theta_node +pi  
+    if (x>=0 and y>=0):
+        if (x_theta>=0 and y_theta>=0): theta = theta - np.pi
+        elif (x_theta<=0 and y_theta<=0): theta = theta
+        elif (x_theta>=0 and y_theta<=0): theta = theta - np.pi/2
+        elif (x_theta<=0 and y_theta>=0): theta = theta + np.pi/2
+        
+    elif (x<=0 and y<=0):
+        if (x_theta>=0 and y_theta>=0): theta = theta
+        elif (x_theta<=0 and y_theta<=0): theta = theta + np.pi
+        elif (x_theta>=0 and y_theta<=0): theta = theta + np.pi/2
+        elif (x_theta<=0 and y_theta>=0): theta = theta - np.pi/2
+        
+    elif (x>=0 and y<=0):
+        if (x_theta>=0 and y_theta>=0): theta = theta + np.pi/2
+        elif (x_theta<=0 and y_theta<=0): theta = theta - np.pi/2 
+        elif (x_theta>=0 and y_theta<=0): theta = theta + np.pi
+        elif (x_theta<=0 and y_theta>=0): theta = theta
+
+    elif (x<0 and y>0):
+        if (x_theta>=0 and y_theta>=0): theta = theta - np.pi/2
+        elif (x_theta<=0 and y_theta<=0): theta = theta + np.pi/2
+        elif (x_theta>=0 and y_theta<=0): theta = theta
+        elif (x_theta<=0 and y_theta>=0): theta = theta - np.pi   
+
+    s2_theta = np.matrix([[np.cos(theta), np.sin(theta),  0], [-np.sin(theta) , np.cos(theta) , 0], [0,  0,  1]])
+    s2_iota = np.matrix([[1,  0,  0], [0, np.cos(iota), np.sin(iota)], [0, -np.sin(iota) , np.cos(iota)]])
+    s2_omega = np.matrix([[np.cos(omega), np.sin(omega),  0], [-np.sin(omega) , np.cos(omega) , 0], [0,  0,  1]])
+    S2 = np.dot(np.dot(s2_theta,s2_iota),s2_omega)
+
+    return S1, S2
+
+
+"""
+Geocentric frame conversions
+"""
+
+############################################
+" GSE to GSM, MAGNETIC FIELD "
+############################################
+
+
+# GSE_to_GSM_mag for separate components, useful for transforming arrays without pandas overhead
+def GSE_to_GSM_mag_components(bx, by, bz, times):
+    # Get all transformation matrices at once
+    T3_matrices = np.array([get_geocentric_transformation_matrices(t)[2] for t in times])
+    # Create coordinate matrix (N x 3) where N is number of rows
+    coords = np.column_stack([bx, by, bz])
+    # Vectorized matrix multiplication using einsum
+    # 'ijk,ik->ij' means: for each i, multiply matrix T3_matrices[i] with vector coords[i,:]
+    GSM_coords = np.einsum('ijk,ik->ij', T3_matrices, coords)
+    bx, by, bz = GSM_coords[:, 0], GSM_coords[:, 1], GSM_coords[:, 2]
+    return bx, by, bz
+
+
+def GSE_to_GSM_mag(df):
+    times = df['time'].values
+    bx, by, bz = GSE_to_GSM_mag_components(df['bx'].values, df['by'].values, df['bz'].values, times)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': times,
+        'bt': df['bt'],
+        'bx': bx,
+        'by': by, 
+        'bz': bz,
+    })
+    return df_transformed
+
+
+############################################
+" GSE to GSM, PLASMA (VELOCITY) "
+############################################
+
+
+# GSE_to_GSM_plas for separate components, useful for transforming arrays without pandas overhead
+def GSE_to_GSM_plas_components(vx, vy, vz, times):
+    T3_matrices = np.array([get_geocentric_transformation_matrices(t)[2] for t in times])
+    # Create coordinate matrix (N x 3) where N is number of rows
+    coords = np.column_stack([vx, vy, vz])
+    # Vectorized matrix multiplication using einsum
+    # 'ijk,ik->ij' means: for each i, multiply matrix T3_matrices[i] with vector coords[i,:]
+    GSM_coords = np.einsum('ijk,ik->ij', T3_matrices, coords)
+    vx, vy, vz = GSM_coords[:, 0], GSM_coords[:, 1], GSM_coords[:, 2]
+    return vx, vy, vz
+
+
+def GSE_to_GSM_plas(df):
+    times = df['time'].values
+    vx, vy, vz = GSE_to_GSM_plas_components(df['vx'].values, df['vy'].values, df['vz'].values, times)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': times,
+        'vt': df['vt'],
+        'vx': vx,
+        'vy': vy, 
+        'vz': vz,
+        'np': df['np'],
+        'tp': df['tp'],
+    })
+    return df_transformed
+
+
+############################################
+" GSE to GSM "
+############################################
+
+
+def GSE_to_GSM(df):
+    # Get all transformation matrices at once
+    times = df['time'].values
+    bx, by, bz = GSE_to_GSM_mag_components(df['bx'].values, df['by'].values, df['bz'].values, times)
+    vx, vy, vz = GSE_to_GSM_plas_components(df['vx'].values, df['vy'].values, df['vz'].values, times)
+    df_transformed = pd.DataFrame({
+        'time': times,
+        'bt': df['bt'],
+        'bx': bx,
+        'by': by, 
+        'bz': bz,
+        'vt': df['vt'],
+        'vx': vx,
+        'vy': vy, 
+        'vz': vz,
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'], #positions remain unchanged as this is a data transform, not position
+        'y': df['y'],
+        'z': df['z'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon']
+    })
+    return df_transformed
+
+
+############################################
+" GSM to GSE, MAGNETIC FIELD "
+############################################
+
+
+# GSM_to_GSE_mag for separate components, useful for transforming arrays without pandas overhead
+def GSM_to_GSE_mag_components(bx, by, bz, times):
+    T3_matrices = np.array([get_geocentric_transformation_matrices(t)[2] for t in times])
+    # Compute inverse matrices for all T3 matrices at once
+    T3_inv_matrices = np.linalg.inv(T3_matrices)
+    # Create coordinate matrix (N x 3) where N is number of rows
+    coords = np.column_stack([bx, by, bz])
+    # Vectorized matrix multiplication using einsum
+    # 'ijk,ik->ij' means: for each i, multiply matrix T3_inv_matrices[i] with vector coords[i,:]
+    GSE_coords = np.einsum('ijk,ik->ij', T3_inv_matrices, coords)
+    bx, by, bz = GSE_coords[:, 0], GSE_coords[:, 1], GSE_coords[:, 2]
+    return bx, by, bz
+
+
+def GSM_to_GSE_mag(df):
+    # Get all transformation matrices at once
+    times = df['time'].values
+    bx, by, bz = GSM_to_GSE_mag_components(df['bx'].values, df['by'].values, df['bz'].values, times)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': times,
+        'bt': df['bt'],
+        'bx': bx,
+        'by': by, 
+        'bz': bz,
+    })
+    return df_transformed
+
+
+############################################
+" GSM to GSE, PLASMA (VELOCITY) "
+############################################
+
+
+# GSM_to_GSE_plas for separate components, useful for transforming arrays without pandas overhead
+def GSM_to_GSE_plas_components(vx, vy, vz, times):
+    T3_matrices = np.array([get_geocentric_transformation_matrices(t)[2] for t in times])
+    # Compute inverse matrices for all T3 matrices at once
+    T3_inv_matrices = np.linalg.inv(T3_matrices)
+    # Create coordinate matrix (N x 3) where N is number of rows
+    coords = np.column_stack([vx, vy, vz])
+    # Vectorized matrix multiplication using einsum
+    # 'ijk,ik->ij' means: for each i, multiply matrix T3_inv_matrices[i] with vector coords[i,:]
+    GSE_coords = np.einsum('ijk,ik->ij', T3_inv_matrices, coords)
+    vx, vy, vz = GSE_coords[:, 0], GSE_coords[:, 1], GSE_coords[:, 2]
+    return vx, vy, vz
+
+
+def GSM_to_GSE_plas(df):
+    times = df['time'].values
+    vx, vy, vz = GSM_to_GSE_plas_components(df['vx'].values, df['vy'].values, df['vz'].values, times)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': times,
+        'vt': df['vt'],
+        'vx': vx,
+        'vy': vy, 
+        'vz': vz,
+        'np': df['np'],
+        'tp': df['tp'],
+    })
+    return df_transformed
+
+
+############################################
+" GSM to GSE "
+############################################
+
+
+def GSM_to_GSE(df):
+    times = df['time'].values
+    bx, by, bz = GSM_to_GSE_mag_components(df['bx'].values, df['by'].values, df['bz'].values, times)
+    vx, vy, vz = GSM_to_GSE_plas_components(df['vx'].values, df['vy'].values, df['vz'].values, times)
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': bx,
+        'by': by, 
+        'bz': bz,
+        'vt': df['vt'],
+        'vx': vx,
+        'vy': vy, 
+        'vz': vz,
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'], #positions remain unchanged as this is a data transform, not position
+        'y': df['y'],
+        'z': df['z'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon']
+    })
+    return df_transformed
+
+
+"""
+Geocentric to approximate RTN frame conversions
+"""
+
+############################################
+############################################
+# GSE_to_RTN_approx_mag for separate components, useful for transforming arrays without pandas overhead
+def GSE_to_RTN_approx_mag_components(bx, by, bz):
+    bx_rtn = -bx
+    by_rtn = -by
+    bz_rtn = bz
+    return bx_rtn, by_rtn, bz_rtn
+
+def GSE_to_RTN_approx_mag(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': -df['bx'],
+        'by': -df['by'], 
+        'bz': df['bz'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+# GSE_to_RTN_approx_plas for separate components, useful for transforming arrays without pandas overhead
+def GSE_to_RTN_approx_plas_components(vx, vy, vz):
+    vx_rtn = -vx
+    vy_rtn = -vy
+    vz_rtn = vz
+    return vx_rtn, vy_rtn, vz_rtn
+
+def GSE_to_RTN_approx_plas(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'vt': df['vt'],
+        'vx': -df['vx'],
+        'vy': -df['vy'], 
+        'vz': df['vz'],
+        'np': df['np'],
+        'tp': df['tp'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+# GSM_to_RTN_approx_mag for separate components, useful for transforming arrays without pandas overhead
+def GSM_to_RTN_approx_mag_components(bx, by, bz, times):
+    bx_gse, by_gse, bz_gse = GSM_to_GSE_mag_components(bx, by, bz, times)
+    bx, by, bz = GSE_to_RTN_approx_mag_components(bx_gse, by_gse, bz_gse)
+    return bx, by, bz
+
+def GSM_to_RTN_approx_mag(df):
+    df_gse = GSM_to_GSE_mag(df)
+    df_transformed = GSE_to_RTN_approx_mag(df_gse)
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+# GSM_to_RTN_approx_plas for separate components, useful for transforming arrays without pandas overhead
+def GSM_to_RTN_approx_plas_components(vx, vy, vz, times):
+    vx_gse, vy_gse, vz_gse = GSM_to_GSE_plas_components(vx, vy, vz, times)
+    vx, vy, vz = GSE_to_RTN_approx_plas_components(vx_gse, vy_gse, vz_gse)
+    return vx, vy, vz
+
+def GSM_to_RTN_approx_plas(df):
+    df_gse = GSM_to_GSE_plas(df)
+    df_transformed = GSE_to_RTN_approx_plas(df_gse)
+    return df_transformed
+############################################
+############################################
+
+"""
+Geocentric - Heliocentric frame conversions
+"""
+
+############################################
+############################################
+# GSE_to_HEE_mag for separate components, useful for transforming arrays without pandas overhead
+def GSE_to_HEE_mag_components(bx, by, bz):
+    bx_hee = -bx
+    by_hee = -by
+    bz_hee = bz
+    return bx_hee, by_hee, bz_hee
+
+def GSE_to_HEE_mag(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': -df['bx'],
+        'by': -df['by'], 
+        'bz': df['bz'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+# GSE_to_HEE_plas for separate components, useful for transforming arrays without pandas overhead
+def GSE_to_HEE_plas_components(vx, vy, vz):
+    vx_hee = -vx
+    vy_hee = -vy
+    vz_hee = vz
+    return vx_hee, vy_hee, vz_hee
+
+def GSE_to_HEE_plas(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'vt': df['vt'],
+        'vx': -df['vx'],
+        'vy': -df['vy'], 
+        'vz': df['vz'],
+        'np': df['np'],
+        'tp': df['tp'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def GSE_to_HEE(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': -df['bx'],
+        'by': -df['by'], 
+        'bz': df['bz'],
+        'vt': df['vt'],
+        'vx': -df['vx'],
+        'vy': -df['vy'], 
+        'vz': df['vz'],
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'], #positions remain unchanged as this is a data transform, not position
+        'y': df['y'],
+        'z': df['z'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon']
+    })
+    return df_transformed
+############################################
+############################################
+
+
+############################################
+############################################
+# HEE_to_GSE_mag for separate components, useful for transforming arrays without pandas overhead
+def HEE_to_GSE_mag_components(bx, by, bz):
+    bx_gse = -bx
+    by_gse = -by
+    bz_gse = bz
+    return bx_gse, by_gse, bz_gse
+
+def HEE_to_GSE_mag(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': -df['bx'],
+        'by': -df['by'], 
+        'bz': df['bz'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+# HEE_to_GSE_plas for separate components, useful for transforming arrays without pandas overhead
+def HEE_to_GSE_plas_components(vx, vy, vz):
+    vx_gse = -vx
+    vy_gse = -vy
+    vz_gse = vz
+    return vx_gse, vy_gse, vz_gse
+
+def HEE_to_GSE_plas(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'vt': df['vt'],
+        'vx': -df['vx'],
+        'vy': -df['vy'], 
+        'vz': df['vz'],
+        'np': df['np'],
+        'tp': df['tp'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEE_to_GSE(df):
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': -df['bx'],
+        'by': -df['by'], 
+        'bz': df['bz'],
+        'vt': df['vt'],
+        'vx': -df['vx'],
+        'vy': -df['vy'], 
+        'vz': df['vz'],
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'], #positions remain unchanged as this is a data transform, not position
+        'y': df['y'],
+        'z': df['z'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon']
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def GSE_to_HAE_mag_components(bx, by, bz, times):
+    bx_hae, by_hae, bz_hae = perform_transform_mag_components(bx, by, bz, times, 'GSE', 'ECLIPJ2000')
+    return bx_hae, by_hae, bz_hae
+
+def GSE_to_HAE_plas_components(vx, vy, vz, times):
+    vx_hae, vy_hae, vz_hae = perform_transform_plas_components(vx, vy, vz, times, 'GSE', 'ECLIPJ2000')
+    return vx_hae, vy_hae, vz_hae
+
+def GSE_to_HAE(df):
+    df_transformed = perform_transform(df, 'GSE', 'ECLIPJ2000')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HAE_to_GSE_mag_components(bx, by, bz, times):
+    bx_gse, by_gse, bz_gse = perform_transform_mag_components(bx, by, bz, times, 'ECLIPJ2000', 'GSE')
+    return bx_gse, by_gse, bz_gse
+
+def HAE_to_GSE_plas_components(vx, vy, vz, times):
+    vx_gse, vy_gse, vz_gse = perform_transform_plas_components(vx, vy, vz, times, 'ECLIPJ2000', 'GSE')
+    return vx_gse, vy_gse, vz_gse
+
+def HAE_to_GSE(df):
+    df_transformed = perform_transform(df, 'ECLIPJ2000', 'GSE')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def GSE_to_HEEQ_mag_components(bx, by, bz, times):
+    bx_heeq, by_heeq, bz_heeq = perform_transform_mag_components(bx, by, bz, times, 'GSE', 'HEEQ')
+    return bx_heeq, by_heeq, bz_heeq
+
+def GSE_to_HEEQ_plas_components(vx, vy, vz, times):
+    vx_heeq, vy_heeq, vz_heeq = perform_transform_plas_components(vx, vy, vz, times, 'GSE', 'HEEQ')
+    return vx_heeq, vy_heeq, vz_heeq
+
+def GSE_to_HEEQ(df):
+    df_transformed = perform_transform(df, 'GSE', 'HEEQ')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEEQ_to_GSE_mag_components(bx, by, bz, times):
+    bx_gse, by_gse, bz_gse = perform_transform_mag_components(bx, by, bz, times, 'HEEQ', 'GSE')
+    return bx_gse, by_gse, bz_gse
+
+def HEEQ_to_GSE_plas_components(vx, vy, vz, times):
+    vx_gse, vy_gse, vz_gse = perform_transform_plas_components(vx, vy, vz, times, 'HEEQ', 'GSE')
+    return vx_gse, vy_gse, vz_gse
+
+def HEEQ_to_GSE(df):
+    df_transformed = perform_transform(df, 'HEEQ', 'GSE')
+    return df_transformed
+############################################
+############################################
+
+"""
+Heliocentric frame conversions
+"""
+
+############################################
+############################################
+def HEE_to_HAE_mag_components(bx, by, bz, times):
+    bx_hae, by_hae, bz_hae = perform_transform_mag_components(bx, by, bz, times, 'HEE', 'ECLIPJ2000')
+    return bx_hae, by_hae, bz_hae
+
+def HEE_to_HAE_plas_components(vx, vy, vz, times):
+    vx_hae, vy_hae, vz_hae = perform_transform_plas_components(vx, vy, vz, times, 'HEE', 'ECLIPJ2000')
+    return vx_hae, vy_hae, vz_hae
+
+def HEE_to_HAE(df):
+    df_transformed = perform_transform(df, 'HEE', 'ECLIPJ2000')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEE_to_HAE_alt(df):
+    B_HAE = []
+    for i in range(df.shape[0]):
+        S1, S2 = get_heliocentric_transformation_matrices(df['time'].iloc[i])
+        S1_inv = np.linalg.inv(S1)
+        B_HEE_i = np.matrix([[df['bx'].iloc[i]],[df['by'].iloc[i]],[df['bz'].iloc[i]]]) 
+        B_HEA_i = np.dot(S1_inv,B_HEE_i)
+        B_HAE_i_list = B_HEA_i.tolist()
+        flat_B_HAE_i = list(itertools.chain(*B_HAE_i_list))
+        B_HAE.append(flat_B_HAE_i)
+    df_transformed = pd.DataFrame(B_HAE, columns=['bx', 'by', 'bz'])
+    df_transformed['bt'] = np.linalg.norm(df_transformed[['bx', 'by', 'bz']], axis=1)
+    df_transformed['time'] = df['time']
+    df_transformed['vx'] = df['vx']
+    df_transformed['vy'] = df['vy']
+    df_transformed['vz'] = df['vz']
+    df_transformed['vt'] = df['vt']
+    df_transformed['np'] = df['np']
+    df_transformed['tp'] = df['tp']
+    df_transformed['x'] = df['x']
+    df_transformed['y'] = df['y']
+    df_transformed['z'] = df['z']
+    df_transformed['y'] = df['y']
+    df_transformed['r'] = df['r']
+    df_transformed['lat'] = df['lat']
+    df_transformed['lon'] = df['lon']
+    return df_transformed
+############################################
+############################################
+
+
+############################################
+############################################
+def HAE_to_HEE_mag_components(bx, by, bz, times):
+    bx_hee, by_hee, bz_hee = perform_transform_mag_components(bx, by, bz, times, 'ECLIPJ2000', 'HEE')
+    return bx_hee, by_hee, bz_hee
+
+def HAE_to_HEE_plas_components(vx, vy, vz, times):
+    vx_hee, vy_hee, vz_hee = perform_transform_plas_components(vx, vy, vz, times, 'ECLIPJ2000', 'HEE')
+    return vx_hee, vy_hee, vz_hee
+
+def HAE_to_HEE(df):
+    df_transformed = perform_transform(df, 'ECLIPJ2000', 'HEE')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HAE_to_HEE_alt(df):
+    B_HEE = []
+    for i in range(df.shape[0]):
+        S1, S2 = get_heliocentric_transformation_matrices(df['time'].iloc[i])
+        B_HAE_i = np.matrix([[df['bx'].iloc[i]],[df['by'].iloc[i]],[df['bz'].iloc[i]]]) 
+        B_HEE_i = np.dot(S1,B_HAE_i)
+        B_HEE_i_list = B_HEE_i.tolist()
+        flat_B_HEE_i = list(itertools.chain(*B_HEE_i_list))
+        B_HEE.append(flat_B_HEE_i)
+    df_transformed = pd.DataFrame(B_HEE, columns=['bx', 'by', 'bz'])
+    df_transformed['bt'] = np.linalg.norm(df_transformed[['bx', 'by', 'bz']], axis=1)
+    df_transformed['time'] = df['time']
+    df_transformed['vx'] = df['vx']
+    df_transformed['vy'] = df['vy']
+    df_transformed['vz'] = df['vz']
+    df_transformed['vt'] = df['vt']
+    df_transformed['np'] = df['np']
+    df_transformed['tp'] = df['tp']
+    df_transformed['x'] = df['x']
+    df_transformed['y'] = df['y']
+    df_transformed['z'] = df['z']
+    df_transformed['y'] = df['y']
+    df_transformed['r'] = df['r']
+    df_transformed['lat'] = df['lat']
+    df_transformed['lon'] = df['lon']
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HAE_to_HEEQ_mag_components(bx, by, bz, times):
+    bx_heeq, by_heeq, bz_heeq = perform_transform_mag_components(bx, by, bz, times, 'ECLIPJ2000', 'HEEQ')
+    return bx_heeq, by_heeq, bz_heeq
+def HAE_to_HEEQ_plas_components(vx, vy, vz, times):
+    vx_heeq, vy_heeq, vz_heeq = perform_transform_plas_components(vx, vy, vz, times, 'ECLIPJ2000', 'HEEQ')
+    return vx_heeq, vy_heeq, vz_heeq
+
+def HAE_to_HEEQ(df):
+    df_transformed = perform_transform(df, 'ECLIPJ2000', 'HEEQ')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HAE_to_HEEQ_alt(df):
+    B_HEEQ = []
+    for i in range(df.shape[0]):
+        S1, S2 = get_heliocentric_transformation_matrices(df['time'].iloc[i])
+        B_HAE_i = np.matrix([[df['bx'].iloc[i]],[df['by'].iloc[i]],[df['bz'].iloc[i]]]) 
+        B_HEEQ_i = np.dot(S2,B_HAE_i)
+        B_HEEQ_i_list = B_HEEQ_i.tolist()
+        flat_B_HEEQ_i = list(itertools.chain(*B_HEEQ_i_list))
+        B_HEEQ.append(flat_B_HEEQ_i)
+    df_transformed = pd.DataFrame(B_HEEQ, columns=['bx', 'by', 'bz'])
+    df_transformed['bt'] = np.linalg.norm(df_transformed[['bx', 'by', 'bz']], axis=1)
+    df_transformed['time'] = df['time']
+    df_transformed['vx'] = df['vx']
+    df_transformed['vy'] = df['vy']
+    df_transformed['vz'] = df['vz']
+    df_transformed['vt'] = df['vt']
+    df_transformed['np'] = df['np']
+    df_transformed['tp'] = df['tp']
+    df_transformed['x'] = df['x']
+    df_transformed['y'] = df['y']
+    df_transformed['z'] = df['z']
+    df_transformed['y'] = df['y']
+    df_transformed['r'] = df['r']
+    df_transformed['lat'] = df['lat']
+    df_transformed['lon'] = df['lon']
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEEQ_to_HAE_mag_components(bx, by, bz, times):
+    bx_hae, by_hae, bz_hae = perform_transform_mag_components(bx, by, bz, times, 'HEEQ', 'ECLIPJ2000')
+    return bx_hae, by_hae, bz_hae
+
+def HEEQ_to_HAE_plas_components(vx, vy, vz, times):
+    vx_hae, vy_hae, vz_hae = perform_transform_plas_components(vx, vy, vz, times, 'HEEQ', 'ECLIPJ2000')
+    return vx_hae, vy_hae, vz_hae
+
+def HEEQ_to_HAE(df):
+    df_transformed = perform_transform(df, 'HEEQ', 'ECLIPJ2000')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEEQ_to_HAE_alt(df):
+    B_HAE = []
+    for i in range(df.shape[0]):
+        S1, S2 = get_heliocentric_transformation_matrices(df['time'].iloc[i])
+        S2_inv = np.linalg.inv(S2)
+        B_HEEQ_i = np.matrix([[df['bx'].iloc[i]],[df['by'].iloc[i]],[df['bz'].iloc[i]]]) 
+        B_HEA_i = np.dot(S2_inv,B_HEEQ_i)
+        B_HAE_i_list = B_HEA_i.tolist()
+        flat_B_HAE_i = list(itertools.chain(*B_HAE_i_list))
+        B_HAE.append(flat_B_HAE_i)
+    df_transformed = pd.DataFrame(B_HAE, columns=['bx', 'by', 'bz'])
+    df_transformed['bt'] = np.linalg.norm(df_transformed[['bx', 'by', 'bz']], axis=1)
+    df_transformed['time'] = df['time']
+    df_transformed['vx'] = df['vx']
+    df_transformed['vy'] = df['vy']
+    df_transformed['vz'] = df['vz']
+    df_transformed['vt'] = df['vt']
+    df_transformed['np'] = df['np']
+    df_transformed['tp'] = df['tp']
+    df_transformed['x'] = df['x']
+    df_transformed['y'] = df['y']
+    df_transformed['z'] = df['z']
+    df_transformed['y'] = df['y']
+    df_transformed['r'] = df['r']
+    df_transformed['lat'] = df['lat']
+    df_transformed['lon'] = df['lon']
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEE_to_HEEQ_mag_components(bx, by, bz, times):
+    bx_heeq, by_heeq, bz_heeq = perform_transform_mag_components(bx, by, bz, times, 'HEE', 'HEEQ')
+    return bx_heeq, by_heeq, bz_heeq
+
+def HEE_to_HEEQ_plas_components(vx, vy, vz, times):
+    vx_heeq, vy_heeq, vz_heeq = perform_transform_plas_components(vx, vy, vz, times, 'HEE', 'HEEQ')
+    return vx_heeq, vy_heeq, vz_heeq
+
+def HEE_to_HEEQ(df):
+    df_transformed = perform_transform(df, 'HEE', 'HEEQ')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEE_to_HEEQ_alt(df):
+    df_hae = HEE_to_HAE_alt(df)
+    df_transformed = HAE_to_HEEQ_alt(df_hae)
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEEQ_to_HEE_mag_components(bx, by, bz, times):
+    bx_hee, by_hee, bz_hee = perform_transform_mag_components(bx, by, bz, times, 'HEEQ', 'HEE')
+    return bx_hee, by_hee, bz_hee
+
+def HEEQ_to_HEE_plas_components(vx, vy, vz, times):
+    vx_hee, vy_hee, vz_hee = perform_transform_plas_components(vx, vy, vz, times, 'HEEQ', 'HEE')
+    return vx_hee, vy_hee, vz_hee
+
+def HEEQ_to_HEE(df):
+    df_transformed = perform_transform(df, 'HEEQ', 'HEE')
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEEQ_to_HEE_alt(df):
+    df_hae = HEEQ_to_HAE_alt(df)
+    df_transformed = HAE_to_HEE_alt(df_hae)
+    return df_transformed
+############################################
+############################################
+
+
+"""
+Heliocentric to RTN frame conversions
+
+# RTN transforms require spacecraft position information
+# Often position files will not have same timestamps as datafiles, 
+# so first need to be interpolated to the same timestamps as the data being transformed
+# input DataFrames are required to be pre-combined with position xyz
+"""
+
+############################################
+############################################
+def interp_to_newtimes(df1, df2):
+    #set time as index of dataframe you want to interpolate
+    df1.set_index(df1.time, inplace=True)
+    df1 = df1.drop(columns=['time'])
+    #define new indices using different dataframe
+    new_indices_mag = pd.DatetimeIndex(df2.time)
+    #perform interpolation of df1 to df2 times
+    out = (df1.reindex(df1.index.union(new_indices_mag))
+         .interpolate('time').loc[new_indices_mag])
+    df_new = out.reset_index(drop=False)
+    return df_new
+
+def combine_dataframes(df1,df2):
+        df1.set_index(df1.time, inplace=True)
+        df1 = df1.drop(columns=['time'])
+        df2.set_index(df2.time, inplace=True)
+        df2 = df2.drop(columns=['time'])
+        combined_df = pd.concat([df1, df2], axis=1)
+        combined_df = combined_df.reset_index(drop=False)
+        return combined_df
+############################################
+############################################
+
+
+
+############################################
+############################################
+#function to transform mag data from HEEQ to RTN, using a DataFrame which has already combined mag, plas and position with same timestamps
+def HEEQ_to_RTN_alt(df):
+    #unit vectors of HEEQ basis
+    heeq_x=[1,0,0]
+    heeq_y=[0,1,0]
+    heeq_z=[0,0,1]
+    B_RTN = []
+    V_RTN = []
+    for i in range(df.shape[0]):
+        #make unit vectors of RTN in basis of HEEQ
+        rtn_r = [df['x'].iloc[i],df['y'].iloc[i],df['z'].iloc[i]]/np.linalg.norm([df['x'].iloc[i],df['y'].iloc[i],df['z'].iloc[i]])
+        rtn_t=np.cross(heeq_z,rtn_r)
+        rtn_n=np.cross(rtn_r,rtn_t)
+
+        br_i=df['bx'].iloc[i]*np.dot(heeq_x,rtn_r)+df['by'].iloc[i]*np.dot(heeq_y,rtn_r)+df['bz'].iloc[i]*np.dot(heeq_z,rtn_r)
+        bt_i=df['bx'].iloc[i]*np.dot(heeq_x,rtn_t)+df['by'].iloc[i]*np.dot(heeq_y,rtn_t)+df['bz'].iloc[i]*np.dot(heeq_z,rtn_t)
+        bn_i=df['bx'].iloc[i]*np.dot(heeq_x,rtn_n)+df['by'].iloc[i]*np.dot(heeq_y,rtn_n)+df['bz'].iloc[i]*np.dot(heeq_z,rtn_n)
+        B_RTN_i = [br_i, bt_i, bn_i]
+        B_RTN.append(B_RTN_i)
+
+        vr_i=df['vx'].iloc[i]*np.dot(heeq_x,rtn_r)+df['vy'].iloc[i]*np.dot(heeq_y,rtn_r)+df['vz'].iloc[i]*np.dot(heeq_z,rtn_r)
+        vt_i=df['vx'].iloc[i]*np.dot(heeq_x,rtn_t)+df['vy'].iloc[i]*np.dot(heeq_y,rtn_t)+df['vz'].iloc[i]*np.dot(heeq_z,rtn_t)
+        vn_i=df['vx'].iloc[i]*np.dot(heeq_x,rtn_n)+df['vy'].iloc[i]*np.dot(heeq_y,rtn_n)+df['vz'].iloc[i]*np.dot(heeq_z,rtn_n)
+        V_RTN_i = [vr_i, vt_i, vn_i]
+        V_RTN.append(V_RTN_i)
+
+    
+    B_RTN = np.array(B_RTN)
+    bx, by, bz = B_RTN[:, 0], B_RTN[:, 1], B_RTN[:, 2]
+    #bt = np.linalg.norm([bx,by,bz], axis=0)
+
+    V_RTN = np.array(V_RTN)
+    vx, vy, vz = V_RTN[:, 0], V_RTN[:, 1], V_RTN[:, 2]
+    #vt = np.linalg.norm([vx,vy,vz], axis=0)
+
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': bx,
+        'by': by, 
+        'bz': bz,
+        'vt': df['vt'],
+        'vx': vx,
+        'vy': vy, 
+        'vz': vz,
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+# HEEQ_to_RTN_mag for separate components, useful for transforming arrays without pandas overhead
+def HEEQ_to_RTN_mag_components(bx, by, bz, x, y, z):
+    # Stack position, magnetic field
+    r_vec = np.stack([x, y, z], axis=-1)
+    b_vec = np.stack([bx, by, bz], axis=-1)
+    # Normalize R (radial unit vector)
+    r_hat = r_vec / np.linalg.norm(r_vec, axis=1)[:, np.newaxis]
+    # Define constant z-axis of HEEQ
+    z_hat = np.array([0, 0, 1])
+    # Calculate T (tangential unit vector): T = Z × R
+    t_hat = np.cross(np.tile(z_hat, (len(r_hat), 1)), r_hat)
+    # Normalize T (to be safe)
+    t_hat /= np.linalg.norm(t_hat, axis=1)[:, np.newaxis]
+    # Calculate N (normal unit vector): N = R × T
+    n_hat = np.cross(r_hat, t_hat)
+    # Project B onto RTN basis
+    rtn_bx = np.einsum('ij,ij->i', b_vec, r_hat)
+    rtn_by = np.einsum('ij,ij->i', b_vec, t_hat)
+    rtn_bz = np.einsum('ij,ij->i', b_vec, n_hat)
+    return rtn_bx, rtn_by, rtn_bz
+
+def HEEQ_to_RTN_mag(df):
+    rtn_bx, rtn_by, rtn_bz = HEEQ_to_RTN_mag_components(df.bx, df.by, df.bz, df.x, df.y, df.z)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': rtn_bx,
+        'by': rtn_by, 
+        'bz': rtn_bz,
+        'vt': df['vt'],
+        'vx': df['vx'],
+        'vy': df['vy'], 
+        'vz': df['vz'],
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+# HEEQ_to_RTN_plas for separate components, useful for transforming arrays without pandas overhead
+def HEEQ_to_RTN_plas_components(vx, vy, vz, x, y, z):
+    # Stack position, magnetic field, and velocity vectors
+    r_vec = np.stack([x, y, z], axis=-1)
+    v_vec = np.stack([vx, vy, vz], axis=-1)
+    # Normalize R (radial unit vector)
+    r_hat = r_vec / np.linalg.norm(r_vec, axis=1)[:, np.newaxis]
+    # Define constant z-axis of HEEQ
+    z_hat = np.array([0, 0, 1])
+    # Calculate T (tangential unit vector): T = Z × R
+    t_hat = np.cross(np.tile(z_hat, (len(r_hat), 1)), r_hat)
+    # Normalize T (to be safe)
+    t_hat /= np.linalg.norm(t_hat, axis=1)[:, np.newaxis]
+    # Calculate N (normal unit vector): N = R × T
+    n_hat = np.cross(r_hat, t_hat)
+    # Project V onto RTN basis
+    rtn_vx = np.einsum('ij,ij->i', v_vec, r_hat)
+    rtn_vy = np.einsum('ij,ij->i', v_vec, t_hat)
+    rtn_vz = np.einsum('ij,ij->i', v_vec, n_hat)
+    return rtn_vx, rtn_vy, rtn_vz
+
+def HEEQ_to_RTN_plas(df):
+    rtn_vx, rtn_vy, rtn_vz = HEEQ_to_RTN_plas_components(df.vx, df.vy, df.vz, df.x, df.y, df.z)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': df['bx'],
+        'by': df['by'], 
+        'bz': df['bz'],
+        'vt': df['vt'],
+        'vx': rtn_vx,
+        'vy': rtn_vy, 
+        'vz': rtn_vz,
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEEQ_to_RTN(df):
+    # Stack position, magnetic field, and velocity vectors
+    r_vec = np.stack([df.x, df.y, df.z], axis=-1)
+    b_vec = np.stack([df.bx, df.by, df.bz], axis=-1)
+    v_vec = np.stack([df.vx, df.vy, df.vz], axis=-1)
+    # Normalize R (radial unit vector)
+    r_hat = r_vec / np.linalg.norm(r_vec, axis=1)[:, np.newaxis]
+    # Define constant z-axis of HEEQ
+    z_hat = np.array([0, 0, 1])
+    # Calculate T (tangential unit vector): T = Z × R
+    t_hat = np.cross(np.tile(z_hat, (len(r_hat), 1)), r_hat)
+    # Normalize T (to be safe)
+    t_hat /= np.linalg.norm(t_hat, axis=1)[:, np.newaxis]
+    # Calculate N (normal unit vector): N = R × T
+    n_hat = np.cross(r_hat, t_hat)
+    # Project B onto RTN basis
+    rtn_bx = np.einsum('ij,ij->i', b_vec, r_hat)
+    rtn_by = np.einsum('ij,ij->i', b_vec, t_hat)
+    rtn_bz = np.einsum('ij,ij->i', b_vec, n_hat)
+    # Project V onto RTN basis
+    rtn_vx = np.einsum('ij,ij->i', v_vec, r_hat)
+    rtn_vy = np.einsum('ij,ij->i', v_vec, t_hat)
+    rtn_vz = np.einsum('ij,ij->i', v_vec, n_hat)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': rtn_bx,
+        'by': rtn_by, 
+        'bz': rtn_bz,
+        'vt': df['vt'],
+        'vx': rtn_vx,
+        'vy': rtn_vy, 
+        'vz': rtn_vz,
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def RTN_to_HEEQ_mag_components(bx, by, bz, x, y, z):
+    # Stack position and magnetic field
+    r_vec = np.stack([x, y, z], axis=-1)
+    b_vec = np.stack([bx, by, bz], axis=-1)
+    # Normalize R (radial unit vector)
+    r_hat = r_vec / np.linalg.norm(r_vec, axis=1)[:, np.newaxis]
+    # HEEQ z-axis
+    z_hat = np.array([0, 0, 1])
+    # T = Z × R
+    t_hat = np.cross(np.tile(z_hat, (len(r_hat), 1)), r_hat)
+    t_hat /= np.linalg.norm(t_hat, axis=1)[:, np.newaxis]
+    # N = R × T
+    n_hat = np.cross(r_hat, t_hat)
+    n_hat /= np.linalg.norm(n_hat, axis=1)[:, np.newaxis]
+    # Construct the RTN → HEEQ rotation matrix for each sample
+    # The RTN basis is [r_hat, t_hat, n_hat]
+    # So, the transformation is B_HEEQ = R.T @ B_RTN
+    # where R = [r_hat, t_hat, n_hat].T per sample
+    # Use einsum for efficient batched dot product
+    R = np.stack([r_hat, t_hat, n_hat], axis=-1)  # shape: (N, 3, 3)
+    b_heeq = np.einsum('nij,nj->ni', R, b_vec)
+    return b_heeq[:, 0], b_heeq[:, 1], b_heeq[:, 2]
+
+
+def RTN_to_HEEQ_mag(df):
+    bx, by, bz = RTN_to_HEEQ_mag_components(df.bx, df.by, df.bz, df.x, df.y, df.z)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': bx,
+        'by': by,
+        'bz': bz,
+        'vt': df['vt'],
+        'vx': df['vx'],
+        'vy': df['vy'],
+        'vz': df['vz'],
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def RTN_to_HEEQ_plas_components(vx, vy, vz, x, y, z):
+    # Stack position and velocity vectors
+    r_vec = np.stack([x, y, z], axis=-1)
+    v_vec = np.stack([vx, vy, vz], axis=-1)
+    # Normalize R (radial unit vector)
+    r_hat = r_vec / np.linalg.norm(r_vec, axis=1)[:, np.newaxis]
+    # HEEQ z-axis
+    z_hat = np.array([0, 0, 1])
+    # T = Z × R
+    t_hat = np.cross(np.tile(z_hat, (len(r_hat), 1)), r_hat)
+    t_hat /= np.linalg.norm(t_hat, axis=1)[:, np.newaxis]
+    # N = R × T
+    n_hat = np.cross(r_hat, t_hat)
+    n_hat /= np.linalg.norm(n_hat, axis=1)[:, np.newaxis]
+    # Construct the RTN → HEEQ rotation matrix for each sample
+    # The RTN basis is [r_hat, t_hat, n_hat]
+    # So, the transformation is B_HEEQ = R.T @ B_RTN
+    # where R = [r_hat, t_hat, n_hat].T per sample
+    # Use einsum for efficient batched dot product
+    R = np.stack([r_hat, t_hat, n_hat], axis=-1)  # shape: (N, 3, 3)
+    v_heeq = np.einsum('nij,nj->ni', R, v_vec)
+    return v_heeq[:, 0], v_heeq[:, 1], v_heeq[:, 2]
+
+def RTN_to_HEEQ_plas(df):
+    vx, vy, vz = RTN_to_HEEQ_plas_components(df.vx, df.vy, df.vz, df.x, df.y, df.z)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': df['bx'],
+        'by': df['by'],
+        'bz': df['bz'],
+        'vt': df['vt'],
+        'vx': vx,
+        'vy': vy,
+        'vz': vz,
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def RTN_to_HEEQ(df):
+    # Stack position, magnetic field, and velocity vectors
+    r_vec = np.stack([df.x, df.y, df.z], axis=-1)
+    b_vec = np.stack([df.bx, df.by, df.bz], axis=-1)
+    v_vec = np.stack([df.vx, df.vy, df.vz], axis=-1)
+    # Normalize R (radial unit vector)
+    r_hat = r_vec / np.linalg.norm(r_vec, axis=1)[:, np.newaxis]
+    # HEEQ z-axis
+    z_hat = np.array([0, 0, 1])
+    # T = Z × R
+    t_hat = np.cross(np.tile(z_hat, (len(r_hat), 1)), r_hat)
+    t_hat /= np.linalg.norm(t_hat, axis=1)[:, np.newaxis]
+    # N = R × T
+    n_hat = np.cross(r_hat, t_hat)
+    n_hat /= np.linalg.norm(n_hat, axis=1)[:, np.newaxis]
+    # Construct the RTN → HEEQ rotation matrix for each sample
+    # The RTN basis is [r_hat, t_hat, n_hat]
+    # So, the transformation is B_HEEQ = R.T @ B_RTN
+    # where R = [r_hat, t_hat, n_hat].T per sample
+    # Use einsum for efficient batched dot product
+    R = np.stack([r_hat, t_hat, n_hat], axis=-1)  # shape: (N, 3, 3)
+    b_heeq = np.einsum('nij,nj->ni', R, b_vec)
+    v_heeq = np.einsum('nij,nj->ni', R, v_vec)
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': b_heeq[:, 0],
+        'by': b_heeq[:, 1], 
+        'bz': b_heeq[:, 2],
+        'vt': df['vt'],
+        'vx': v_heeq[:, 0],
+        'vy': v_heeq[:, 1],
+        'vz': v_heeq[:, 2],
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+    
+
+
+############################################
+############################################
+def RTN_to_HEEQ_alt(df):
+    #HEEQ unit vectors (same as spacecraft xyz position)
+    heeq_x=[1,0,0]
+    heeq_y=[0,1,0]
+    heeq_z=[0,0,1]
+    B_HEEQ = []
+    V_HEEQ = []
+    # go through all data points    
+    for i in range(df.shape[0]):                
+        #make normalized RTN unit vectors from spacecraft position in HEEQ basis
+        rtn_x=[df['x'].iloc[i],df['y'].iloc[i],df['z'].iloc[i]]/np.linalg.norm([df['x'].iloc[i],df['y'].iloc[i],df['z'].iloc[i]])
+        rtn_y=np.cross(heeq_z,rtn_x)/np.linalg.norm(np.cross(heeq_z,rtn_x))
+        rtn_z=np.cross(rtn_x, rtn_y)/np.linalg.norm(np.cross(rtn_x, rtn_y))
+        
+        #project into new system (HEEQ)
+        bx_i=np.dot(np.dot(df['bx'].iloc[i],rtn_x)+np.dot(df['by'].iloc[i],rtn_y)+np.dot(df['bz'].iloc[i],rtn_z),heeq_x)
+        by_i=np.dot(np.dot(df['bx'].iloc[i],rtn_x)+np.dot(df['by'].iloc[i],rtn_y)+np.dot(df['bz'].iloc[i],rtn_z),heeq_y)
+        bz_i=np.dot(np.dot(df['bx'].iloc[i],rtn_x)+np.dot(df['by'].iloc[i],rtn_y)+np.dot(df['bz'].iloc[i],rtn_z),heeq_z)
+        B_HEEQ_i = [bx_i, by_i, bz_i]
+        B_HEEQ.append(B_HEEQ_i)
+
+        vx_i=np.dot(np.dot(df['vx'].iloc[i],rtn_x)+np.dot(df['vy'].iloc[i],rtn_y)+np.dot(df['vz'].iloc[i],rtn_z),heeq_x)
+        vy_i=np.dot(np.dot(df['vx'].iloc[i],rtn_x)+np.dot(df['vy'].iloc[i],rtn_y)+np.dot(df['vz'].iloc[i],rtn_z),heeq_y)
+        vz_i=np.dot(np.dot(df['vx'].iloc[i],rtn_x)+np.dot(df['vy'].iloc[i],rtn_y)+np.dot(df['vz'].iloc[i],rtn_z),heeq_z)
+        V_HEEQ_i = [vx_i, vy_i, vz_i]
+        V_HEEQ.append(V_HEEQ_i)
+
+    B_HEEQ = np.array(B_HEEQ)
+    bx, by, bz = B_HEEQ[:, 0], B_HEEQ[:, 1], B_HEEQ[:, 2]
+    #bt = np.linalg.norm([bx,by,bz], axis=0)
+
+    V_HEEQ = np.array(V_HEEQ)
+    vx, vy, vz = V_HEEQ[:, 0], V_HEEQ[:, 1], V_HEEQ[:, 2]
+    #vt = np.linalg.norm([vx,vy,vz], axis=0)
+
+    # Create result DataFrame
+    df_transformed = pd.DataFrame({
+        'time': df['time'].values,
+        'bt': df['bt'],
+        'bx': bx,
+        'by': by, 
+        'bz': bz,
+        'vt': df['vt'],
+        'vx': vx,
+        'vy': vy, 
+        'vz': vz,
+        'np': df['np'],
+        'tp': df['tp'],
+        'x': df['x'],
+        'y': df['y'],
+        'z': df['z'],
+        'y': df['y'],
+        'r': df['r'],
+        'lat': df['lat'],
+        'lon': df['lon'],
+    })
+    return df_transformed
+############################################
+############################################
+
+
+
+############################################
+############################################
+def RTN_to_HAE_components(bx, by, bz, x, y, z, times):
+    bx_heeq, by_heeq, bz_heeq = RTN_to_HEEQ_mag_components(bx, by, bz, x, y, z)
+    bx_hae, by_hae, bz_hae = HEEQ_to_HAE_mag_components(bx_heeq, by_heeq, bz_heeq, times)
+    return bx_hae, by_hae, bz_hae
+
+def RTN_to_HAE(df_rtn):
+    df_heeq = RTN_to_HEEQ(df_rtn)
+    df_hae = HEEQ_to_HAE(df_heeq)
+    return df_hae
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HAE_to_RTN_components(bx, by, bz, x, y, z, times):
+    bx_heeq, by_heeq, bz_heeq = HAE_to_HEEQ_mag_components(bx, by, bz, times)
+    bx_rtn, by_rtn, bz_rtn = HEEQ_to_RTN_mag_components(bx_heeq, by_heeq, bz_heeq, x, y, z)
+    return bx_rtn, by_rtn, bz_rtn
+
+def HAE_to_RTN(df_hae):
+    df_heeq = HAE_to_HEEQ(df_hae)
+    df_rtn = HEEQ_to_RTN(df_heeq)
+    return df_rtn
+############################################
+############################################
+
+
+
+############################################
+############################################
+def RTN_to_HEE_components(bx, by, bz, x, y, z, times):
+    bx_heeq, by_heeq, bz_heeq = RTN_to_HEEQ_mag_components(bx, by, bz, x, y, z)
+    bx_hee, by_hee, bz_hee = HEEQ_to_HEE_mag_components(bx_heeq, by_heeq, bz_heeq, times)
+    return bx_hee, by_hee, bz_hee
+
+def RTN_to_HEE(df_rtn):
+    df_heeq = RTN_to_HEEQ(df_rtn)
+    df_hee = HEEQ_to_HEE(df_heeq)
+    return df_hee
+############################################
+############################################
+
+
+
+############################################
+############################################
+def HEE_to_RTN_mag_components(bx, by, bz, x, y, z, times):
+    bx_heeq, by_heeq, bz_heeq = HEE_to_HEEQ_mag_components(bx, by, bz, times)
+    bx_rtn, by_rtn, bz_rtn = HEEQ_to_RTN_mag_components(bx_heeq, by_heeq, bz_heeq, x, y, z)
+    return bx_rtn, by_rtn, bz_rtn
+
+def HEE_to_RTN(df_hee):
+    df_heeq = HEE_to_HEEQ(df_hee)
+    df_rtn = HEEQ_to_RTN(df_heeq)
+    return df_rtn
+############################################
+############################################
+
+
+
+############################################
+############################################
+def RTN_to_GSE_components(bx, by, bz, x, y, z, times):
+    bx_heeq, by_heeq, bz_heeq = RTN_to_HEEQ_mag_components(bx, by, bz, x, y, z)
+    bx_gse, by_gse, bz_gse = HEEQ_to_GSE_mag_components(bx_heeq, by_heeq, bz_heeq, times)
+    return bx_gse, by_gse, bz_gse
+
+def RTN_to_GSE(df_rtn):
+    df_heeq = RTN_to_HEEQ(df_rtn)
+    df_gse = HEEQ_to_GSE(df_heeq)
+    return df_gse
+############################################
+############################################
+
+
+
+############################################
+############################################
+def GSE_to_RTN_components(bx, by, bz, x, y, z, times):
+    bx_heeq, by_heeq, bz_heeq = GSE_to_HEEQ_mag_components(bx, by, bz, times)
+    bx_rtn, by_rtn, bz_rtn = HEEQ_to_RTN_mag_components(bx_heeq, by_heeq, bz_heeq, x, y, z)
+    return bx_rtn, by_rtn, bz_rtn
+
+def GSE_to_RTN(df_gse):
+    df_heeq = GSE_to_HEEQ(df_gse)
+    df_rtn = HEEQ_to_RTN(df_heeq)
+    return df_rtn
+############################################
+############################################
+
+
+
+############################################
+############################################
+def RTN_to_GSM_components(bx, by, bz, x, y, z, times):
+    bx_gse, by_gse, bz_gse = RTN_to_GSE_components(bx, by, bz, x, y, z, times)
+    bx_gsm, by_gsm, bz_gsm = GSE_to_GSM_mag_components(bx_gse, by_gse, bz_gse, times)
+    return bx_gsm, by_gsm, bz_gsm
+
+def RTN_to_GSM(df_rtn):
+    df_gse = RTN_to_GSE(df_rtn)
+    df_gsm = GSE_to_GSM(df_gse)
+    return df_gsm
+############################################
+############################################
+
+
+
+############################################
+############################################
+def GSM_to_RTN_components(bx, by, bz, x, y, z, times):
+    bx_gse, by_gse, bz_gse = GSM_to_GSE_mag_components(bx, by, bz, times)
+    bx_rtn, by_rtn, bz_rtn = GSE_to_RTN_components(bx_gse, by_gse, bz_gse, x, y, z, times)
+    return bx_rtn, by_rtn, bz_rtn
+
+def GSM_to_RTN(df_gsm):
+    df_gse = GSM_to_GSE(df_gsm)
+    df_rtn = GSE_to_RTN(df_gse)
+    return df_rtn
+############################################
+############################################
+
+"""
+Transform matrices directly from spice kernels
+#requires furnishing with generic kernels 
+"""
+
+def generic_furnish():
+    """Main"""
+    generic_path = Path(kernels_path) / "generic/"
+    generic_kernels = os.listdir(generic_path)
+    for kernel in generic_kernels:
+        spiceypy.furnsh(str(Path(generic_path/ kernel)))
+
+def get_transform(epoch: datetime, base_frame: str, to_frame: str):
+    """Return transformation matrix at a given epoch."""
+    transform = spiceypy.pxform(base_frame, to_frame, spiceypy.datetime2et(epoch))
+    return transform
+
+##############################################
+##############################################
+def perform_transform_mag_components(bx, by, bz, timeseries, base_frame: str, to_frame: str):
+    generic_furnish()
+    B_BASE = np.vstack((bx, by, bz)).T
+    transformation_matrices = np.array([get_transform(t, base_frame, to_frame) for t in timeseries])
+    B_TO = np.einsum('ijk,ik->ij', transformation_matrices, B_BASE)
+    spiceypy.kclear()
+    return B_TO[:,0], B_TO[:,1], B_TO[:,2]
+
+def perform_mag_transform(df, base_frame: str, to_frame: str):
+    timeseries = df.time
+    bx, by, bz = perform_transform_mag_components(df.bx, df.by, df.bz, timeseries, base_frame, to_frame)
+    df_transformed = pd.concat([timeseries], axis=1)
+    df_transformed['bt'] = df.bt
+    df_transformed['bx'] = bx
+    df_transformed['by'] = by
+    df_transformed['bz'] = bz
+    spiceypy.kclear()
+    return df_transformed
+##############################################
+##############################################
+
+
+
+##############################################
+##############################################
+def perform_transform_plas_components(vx, vy, vz, timeseries, base_frame: str, to_frame: str):
+    generic_furnish()
+    V_BASE = np.vstack((vx, vy, vz)).T
+    transformation_matrices = np.array([get_transform(t, base_frame, to_frame) for t in timeseries])
+    V_TO = np.einsum('ijk,ik->ij', transformation_matrices, V_BASE)
+    spiceypy.kclear()
+    return V_TO[:,0], V_TO[:,1], V_TO[:,2]
+
+def perform_plas_transform(df, base_frame: str, to_frame: str):
+    timeseries = df.time
+    vx, vy, vz = perform_transform_plas_components(df.vx, df.vy, df.vz, timeseries, base_frame, to_frame)
+    df_transformed = pd.concat([timeseries], axis=1)
+    df_transformed['vt'] = df.vt
+    df_transformed['vx'] = vx
+    df_transformed['vy'] = vy
+    df_transformed['vz'] = vz
+    df_transformed['np'] = df.np
+    df_transformed['tp'] = df.tp
+    spiceypy.kclear()
+    return df_transformed
+##############################################
+##############################################
+
+
+
+##############################################
+##############################################
+def perform_transform(df, base_frame: str, to_frame: str):
+    timeseries = df.time
+    bx, by, bz = perform_transform_mag_components(df.bx, df.by, df.bz, timeseries, base_frame, to_frame)
+    vx, vy, vz = perform_transform_plas_components(df.vx, df.vy, df.vz, timeseries, base_frame, to_frame)
+    df_transformed = pd.concat([timeseries], axis=1)
+    df_transformed['bt'] = df.bt
+    df_transformed['bx'] = bx
+    df_transformed['by'] = by
+    df_transformed['bz'] = bz
+    df_transformed['vt'] = df.vt
+    df_transformed['vx'] = vx
+    df_transformed['vy'] = vy
+    df_transformed['vz'] = vz
+    df_transformed['np'] = df.np
+    df_transformed['tp'] = df.tp
+    df_transformed['x'] = df['x'] #positions same: no transform applied
+    df_transformed['y'] = df['y']
+    df_transformed['z'] = df['z']
+    df_transformed['y'] = df['y']
+    df_transformed['r'] = df['r']
+    df_transformed['lat'] = df['lat']
+    df_transformed['lon'] = df['lon']
+    spiceypy.kclear()
+    return df_transformed
+#############################################
+#############################################
