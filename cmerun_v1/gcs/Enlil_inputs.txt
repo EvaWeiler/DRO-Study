@@ -1,0 +1,27 @@
+Measurement Technique: GCS---cone
+Detecting Instruments:
+SOHO: FakeCCOR1
+STEREO A: FakeCCOR1
+Image Type: base difference
+Speed (km/s): 1420.4
+Speed measured at height (Rs): 16.5
+Direction (LON/LAT in HEEQ): -4.7/ -10.7
+Half Angular Width (degree): 32.2
+Minor Half-width (degree): None Entered
+Tilt (degree): None Entered
+Time@21.5: 2026-01-18T19:51Z
+
+
+
+Measurement Technique: GCS---croissant
+Detecting Instruments:
+SOHO: FakeCCOR1
+STEREO A: FakeCCOR1
+Image Type: base difference
+Speed (km/s): 1217.5
+Speed measured at height (Rs): 17.1
+Direction (LON/LAT in HEEQ): -11.8/ -21.3
+Half Angular Width (degree): 45.8
+Minor Half-width (degree): 22.8
+Tilt (degree): 30.8
+Time@21.5: 2026-01-18T19:52Z
