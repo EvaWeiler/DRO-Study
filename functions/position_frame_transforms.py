@@ -19,6 +19,12 @@ def cart2sphere(x,y,z):
     return (r, theta, phi)
 
 
+def sphere2cart(r,lat,lon):
+    x = r*np.cos( lat*(np.pi/180) ) * np.cos( lon*(np.pi/180) )
+    y = r*np.cos( lat*(np.pi/180) ) * np.sin( lon*(np.pi/180) )
+    z = r*np.sin( lat*(np.pi/180) )
+    return(x,y,z)
+
 #input datetime to return T1, T2 and T3 based on Hapgood 1992
 #http://www.igpp.ucla.edu/public/vassilis/ESS261/Lecture03/Hapgood_sdarticle.pdf
 def get_geocentric_transformation_matrices(time):
