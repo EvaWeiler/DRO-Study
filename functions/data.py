@@ -329,19 +329,21 @@ def check(x, time_diff, cme_prop_time, cme_delta, distance0, f, halfwidth): #v_s
 #ambient_wind_init = [400., ambient_wind_update]
 #speed_init = [data_donki.speed[index], speed_update]
 
-def donki_kinematics(earth, wind, solo, data_donki, params_opt, distance0):
+def donki_kinematics(earth, wind, sc_measure, data_donki, params_opt, distance0):
     
     print('   ')
     print('Processing..')
     
     #print(data_donki['associatedCMEID'][index])
     
+    solo = sc_measure
+
     #index = data_donki.associatedCMEID[data_donki.associatedCMEID == '2024-02-27T11:36:00-CME-001'].index[0]
     distance0 = distance0 #21.5*u.solRad.to(u.km)
     t0 = data_donki.time21_5
     t0_num = mdates.date2num(t0)
 
-    kindays = 15
+    kindays = 2
     n_ensemble = 100000
     halfwidth = np.deg2rad(35.)
     #halfwidth = np.deg2rad(data_donki.halfAngle[index])
@@ -396,12 +398,12 @@ def donki_kinematics(earth, wind, solo, data_donki, params_opt, distance0):
     
     
     delta_solo_list = []
-    for j in range(kindays_in_min):
-        if np.abs(np.deg2rad(data_donki.longitude)) + np.abs(solo.lon[solo_ind+j:solo_ind+(j+1)]) > np.pi and np.sign(np.deg2rad(data_donki.longitude)) != np.sign(solo.lon[solo_ind+j:solo_ind+(j+1)]):
-            delta_solo = (np.deg2rad(data_donki.longitude) - (solo.lon[solo_ind+j:solo_ind+(j+1)] + 2 * np.pi * np.sign(np.deg2rad(data_donki.longitude))))[0]
+    for j in range(len(solo.time)-1):
+        if np.abs(np.deg2rad(data_donki.longitude)) + np.abs(solo.lon[solo_ind+j]) > np.pi and np.sign(np.deg2rad(data_donki.longitude)) != np.sign(solo.lon[solo_ind+j]):
+            delta_solo = (np.deg2rad(data_donki.longitude) - (solo.lon[solo_ind+j] + 2 * np.pi * np.sign(np.deg2rad(data_donki.longitude))))
 
         else:
-            delta_solo = (np.deg2rad(data_donki.longitude) - solo.lon[solo_ind+j:solo_ind+(j+1)])[0]
+            delta_solo = (np.deg2rad(data_donki.longitude) - solo.lon[solo_ind+j])
             
         delta_solo_list.append(delta_solo)
     
