@@ -343,9 +343,9 @@ def donki_kinematics(earth, wind, sc_measure, data_donki, params_opt, distance0)
     t0 = data_donki.time21_5
     t0_num = mdates.date2num(t0)
 
-    kindays = 2
+    kindays = 2.5
     n_ensemble = 100000
-    halfwidth = np.deg2rad(35.)
+    halfwidth = np.deg2rad(data_donki.halfAngle)
     #halfwidth = np.deg2rad(data_donki.halfAngle[index])
     #print(np.rad2deg(halfwidth))
     res_in_min = 10
@@ -373,9 +373,11 @@ def donki_kinematics(earth, wind, sc_measure, data_donki, params_opt, distance0)
         
     dct1 = t0_num-solo.time
     solo_ind = np.argmin(np.abs(dct1))
+    print(solo_ind, mdates.num2date(solo.time[solo_ind]))
     
     dct2 = t0_num_kindays-solo.time
     solo_ind2 = np.argmin(np.abs(dct2))
+    print(solo_ind2, mdates.num2date(solo.time[solo_ind2]))
 
     delta_earth_list = []
     for j in range(kindays_in_min):
@@ -398,7 +400,7 @@ def donki_kinematics(earth, wind, sc_measure, data_donki, params_opt, distance0)
     
     
     delta_solo_list = []
-    for j in range(len(solo.time)-1):
+    for j in range(kindays_in_min):#len(solo.time)-solo_ind):
         if np.abs(np.deg2rad(data_donki.longitude)) + np.abs(solo.lon[solo_ind+j]) > np.pi and np.sign(np.deg2rad(data_donki.longitude)) != np.sign(solo.lon[solo_ind+j]):
             delta_solo = (np.deg2rad(data_donki.longitude) - (solo.lon[solo_ind+j] + 2 * np.pi * np.sign(np.deg2rad(data_donki.longitude))))
 
